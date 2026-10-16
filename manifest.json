@@ -1,0 +1,19 @@
+{
+  "name": "DiziBOX TV for Nuvio",
+  "version": "1.0.0",
+  "scrapers": [
+    {
+      "id": "dizibox-tv",
+      "name": "DiziBOX TV",
+      "description": "Series from Dizibox's public directory, with direct player resolution and checked HLS playlists.",
+      "version": "1.0.0",
+      "filename": "dizibox.js",
+      "supportedTypes": ["tv", "series"],
+      "contentLanguage": ["tr"],
+      "formats": ["m3u8"],
+      "enabled": true,
+      "hasSettings": true,
+      "supportsExternalPlayer": true
+    }
+  ]
+}
