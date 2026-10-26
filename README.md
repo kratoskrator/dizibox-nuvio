@@ -2,6 +2,8 @@
 
 A series provider for Nuvio that runs directly on your device. It finds shows in Dizibox's public series directory, follows the actual season and episode links, resolves the current DBX/Molystream player, and verifies its HLS playlist before offering a source. No PC or hosted resolver is needed during use.
 
+Version **1.0.1** starts metadata and directory requests together, returns the first verified source, and lets an independent listed player work when another host is blocked. Requests share a 45-second lookup budget, transient GET failures receive at most one retry, and native cancellation stops outstanding work after a lookup ends. It also enforces the TV's limit in UTF-8 bytes and avoids manually forwarding cookies through native redirects.
+
 ## Install on your TV
 
 In Nuvio, open Settings → Plugins → Add repository and paste:
@@ -19,13 +21,13 @@ Refresh and enable **DiziBOX TV**. Open a series, choose a season and episode, t
 
 The site's search endpoints timed out during testing, so this provider reads the public series directory instead. Matching uses the title, original title, available year and exact listed episode. Later seasons can require an additional season-page request. If the primary player has no usable source, the provider can try listed alternative player pages for that same episode.
 
-Player encryption is decoded as static data using Nuvio's built-in `crypto-js` module. Downloaded JavaScript is never executed. The provider requires a Nuvio runtime with CryptoJS support, preserves playback request headers and includes subtitle tracks only when the player exposes them. HLS sources that fail validation are omitted; resolution is shown as Auto when the player has not supplied a verified quality.
+Player encryption is decoded as static data using Nuvio's built-in `crypto-js` module. Downloaded JavaScript is never executed. The provider requires a Nuvio runtime with CryptoJS support, preserves playback request headers and includes subtitle tracks only when the player exposes them. HLS sources must contain actual playlist entries and must not declare unsupported DRM. Quality comes from the verified manifest's resolution; otherwise it is shown as Auto.
 
 ## Compatibility and validation
 
 The bundle uses ES5 and Promise chains. It does not rely on Node built-in APIs, a browser DOM, Cheerio, `URL`, timers or a local server. It was tested under the current Nuvio TV QuickJS polyfill with official CryptoJS, 32 MiB memory and a 512 KiB stack.
 
-The finished bundle completed live native HTTPS lookups for Breaking Bad S1E1 and Squid Game S1E1, returning one validated HLS stream each in about five seconds. Returned master and media playlists responded with HTTP 200 using the plugin's headers. See [VALIDATION.md](VALIDATION.md) for details.
+On 26 October 2026, the finished bundle completed live checks for Breaking Bad S2E3 and Squid Game S1E1 in about 5.0 and 3.8 seconds, including verification of returned master and media playlists. Both returned 1080p HLS through the unmodified Nuvio TV network service. The checks used the TV's exact QuickJS polyfill with local TMDB metadata fixtures; website and playlist requests were live. See [VALIDATION.md](VALIDATION.md) for details.
 
 Physical Samsung TV video playback has not been tested. Availability can change with site updates, network restrictions, TV codecs or runtime limits. The directory currently fits the TV's 1 MiB response limit; substantial growth could require a lookup update. Browser verification is reported as an access restriction and is not solved by this provider.
 

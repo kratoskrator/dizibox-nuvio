@@ -1,4 +1,4 @@
-/* DiziBOX TV for Nuvio v1.0.0
+/* DiziBOX TV for Nuvio v1.0.1
 MIT License
 
 Copyright (c) 2026 DiziBOX TV Nuvio provider contributors
@@ -104,78 +104,238 @@ module.exports = { entities: entities, text: text, attr: attr, origin: origin, a
 'use strict';
 var u = require("utils");
 var USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+var MAX_BYTES = 1024 * 1024;
 
-function failure(message, blocked) {
+function safeError(message, blocked, transient, cancelled) {
   var error = new Error(message);
   error.providerSafe = true;
   error.siteBlocked = !!blocked;
+  error.providerTransient = !!transient;
+  error.providerCancelled = !!cancelled;
   return error;
 }
 
-// A separate jar per lookup keeps anonymous site sessions out of other providers.
-function session() { return { cookies: {} }; }
-function saveCookies(response, url, jar) {
-  if (!jar || !response.headers || typeof response.headers.get !== 'function') return;
-  var raw = response.headers.get('set-cookie');
-  if (!raw) return;
-  var list = Array.isArray(raw) ? raw : String(raw).split(/,(?=\s*[^;,=\s]+\s*=)/);
-  var site = u.origin(url);
-  if (!jar.cookies[site]) jar.cookies[site] = {};
-  list.forEach(function (entry) {
-    var pair = /^\s*([^=;,\s]+)=([^;\r\n]*)/.exec(entry);
-    if (pair) jar.cookies[site][pair[1]] = pair[2];
-  });
+// Only request state is retained. Native TV redirects do not safely scope a
+// manually supplied Cookie header, so this provider never copies site cookies.
+function session() { return { deadline: Date.now() + 45000, blocked: {}, pending: [], cancelled: false }; }
+
+// The native TV fetch bridge supports AbortController even when the guest has
+// no timers. Stop unused alternatives once the caller has a verified source.
+function cancel(state) {
+  if (!state || state.cancelled) return;
+  state.cancelled = true;
+  var pending = (state.pending || []).slice();
+  state.pending = [];
+  pending.forEach(function (abort) { abort(); });
+}
+
+function byteLength(value) {
+  var bytes = 0;
+  for (var i = 0; i < value.length && bytes <= MAX_BYTES; i++) {
+    var ch = value.charCodeAt(i);
+    if (ch < 128) bytes++;
+    else if (ch < 2048) bytes += 2;
+    else if (ch >= 55296 && ch <= 56319 && i + 1 < value.length && value.charCodeAt(i + 1) >= 56320 && value.charCodeAt(i + 1) <= 57343) { bytes += 4; i++; }
+    else bytes += 3;
+  }
+  return bytes;
+}
+
+function readBody(response, options) {
+  if (options.binary) {
+    if (typeof response.arrayBuffer !== 'function' || typeof Uint8Array === 'undefined') return Promise.reject(safeError('Runtime binary responses unavailable'));
+    return response.arrayBuffer().then(function (buffer) {
+      if (buffer.byteLength > 4096) throw safeError('Media verification response exceeds size limit');
+      var bytes = new Uint8Array(buffer), data = [];
+      for (var i = 0; i < bytes.length; i++) data.push(bytes[i]);
+      return { body: '', bytes: bytes.length, data: data };
+    });
+  }
+  return response.text().then(function (body) { return { body: body, bytes: byteLength(body) }; });
 }
 
 function request(url, options) {
   options = options || {};
-  if (!/^https?:\/\/[^\s]+$/i.test(url)) return Promise.reject(failure('Unsupported request address.'));
+  if (!/^https?:\/\/[^\s/?#@]+(?:[/?#][^\s]*)?$/i.test(url)) return Promise.reject(safeError('Unsupported request URL'));
   var site = u.origin(url);
-  var headers = { 'User-Agent': USER_AGENT, Accept: options.json ? 'application/json' : 'text/html,application/xhtml+xml,*/*;q=0.8', 'Accept-Language': 'tr-TR,tr;q=0.9,en;q=0.8' };
+  var state = options.session || session();
+  var method = String(options.method || (options.body !== undefined ? 'POST' : 'GET')).toUpperCase();
+  var timeout = Math.min(Math.max(Number(options.timeout) || 12000, 1), 12000);
+  var headers = {
+    'User-Agent': USER_AGENT,
+    Accept: options.json ? 'application/json, text/javascript, */*; q=0.01' : 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'tr-TR,tr;q=0.9,en;q=0.8'
+  };
   if (options.referer) headers.Referer = options.referer;
   if (options.origin) headers.Origin = options.origin;
+  if (options.search) headers['X-Requested-With'] = 'fetch';
   if (options.bearer) headers.Authorization = 'Bearer ' + options.bearer;
   if (options.body !== undefined) headers['Content-Type'] = 'application/x-www-form-urlencoded';
-  var jar = options.session;
-  if (jar && jar.cookies[site]) {
-    var cookie = Object.keys(jar.cookies[site]).map(function (name) { return name + '=' + jar.cookies[site][name]; }).join('; ');
-    if (cookie) headers.Cookie = cookie;
-  }
-  var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
-  var timer = null;
-  var finished = false;
-  return new Promise(function (resolve, reject) {
-    function finish(error, value) {
-      if (finished) return;
-      finished = true;
-      if (timer !== null && typeof clearTimeout === 'function') clearTimeout(timer);
-      if (error) reject(error); else resolve(value);
-    }
-    if (typeof setTimeout === 'function') timer = setTimeout(function () {
-      finish(failure('Request timed out: ' + site));
-      if (controller) controller.abort();
-    }, options.timeout || 9000);
-    var init = { method: options.body !== undefined ? 'POST' : 'GET', headers: headers };
-    if (options.body !== undefined) init.body = options.body;
-    if (controller) init.signal = controller.signal;
-    Promise.resolve().then(function () { return fetch(url, init); }).then(function (response) {
-      saveCookies(response, url, jar);
-      if (response.status === 403 || response.status === 429 || response.status === 451) throw failure('Website verification or access restriction (HTTP ' + response.status + '): ' + site + '. A standalone TV plugin cannot complete CAPTCHA verification.', true);
-      if (!response.ok) throw failure('HTTP ' + response.status + ': ' + site);
-      return response.text();
-    }).then(function (body) {
-      if (body.length > 1024 * 1024) throw failure('Response exceeds TV size limit: ' + site);
-      if (/<title>\s*(?:Just a moment|Attention Required|Doğrulama gerekiyor)/i.test(body) || /cf-browser-verification|class=["']cf-turnstile/i.test(body)) throw failure('Website CAPTCHA verification required: ' + site, true);
-      if (!options.json) return finish(null, body);
-      var value;
-      try { value = JSON.parse(body); } catch (ignored) { throw failure('Invalid JSON response: ' + site); }
-      finish(null, value);
-    }).catch(function (error) { finish(error && error.providerSafe ? error : failure('Network request failed: ' + site)); });
+  Object.keys(options.headers || {}).forEach(function (name) {
+    if (/^(?:cookie|host|content-length|connection|proxy-authorization)$/i.test(name)) return;
+    headers[name] = String(options.headers[name]);
   });
+
+  function blocked(message) {
+    state.blocked[site] = message;
+    return safeError(message, true);
+  }
+
+  function attempt(number) {
+    if (state.cancelled) return Promise.reject(safeError('Lookup cancelled: ' + site, false, false, true));
+    if (state.blocked[site]) return Promise.reject(safeError(state.blocked[site], true));
+    var remaining = state.deadline - Date.now();
+    if (remaining <= 0) return Promise.reject(safeError('Lookup time budget exhausted: ' + site));
+    var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    var timer = null;
+    var finished = false;
+    return new Promise(function (resolve, reject) {
+      function cancelPending() {
+        finish(safeError('Lookup cancelled: ' + site, false, false, true));
+        if (controller) controller.abort();
+      }
+      function finish(error, value) {
+        if (finished) return;
+        finished = true;
+        if (timer !== null && typeof clearTimeout === 'function') clearTimeout(timer);
+        var pendingIndex = state.pending.indexOf(cancelPending);
+        if (pendingIndex !== -1) state.pending.splice(pendingIndex, 1);
+        if (error) reject(error); else resolve(value);
+      }
+      if (!state.pending) state.pending = [];
+      state.pending.push(cancelPending);
+      if (typeof setTimeout === 'function') {
+        timer = setTimeout(function () {
+          finish(safeError('Request timed out: ' + site, false, true));
+          if (controller) controller.abort();
+        }, Math.min(timeout, remaining));
+      }
+      var init = { method: method, headers: headers, credentials: 'same-origin' };
+      if (options.body !== undefined) init.body = options.body;
+      if (controller) init.signal = controller.signal;
+      Promise.resolve().then(function () {
+        if (finished) return null;
+        return fetch(url, init);
+      }).then(function (response) {
+        if (finished) return;
+        var mitigation = response.headers && typeof response.headers.get === 'function' ? response.headers.get('cf-mitigated') : '';
+        if (response.status === 403 || response.status === 429 || response.status === 451) throw blocked('Site access blocked (HTTP ' + response.status + '): ' + site);
+        if (mitigation === 'challenge') throw blocked('Cloudflare challenge: ' + site);
+        if (!response.status) throw safeError('Network request failed: ' + site, false, true);
+        return readBody(response, options).then(function (result) {
+          if (finished) return;
+          var body = result.body;
+          var receivedBytes = result.bytes;
+          // The native bridge can truncate exactly at its byte quota without a
+          // separate truncation flag. A quota-sized body cannot be trusted.
+          if (receivedBytes >= MAX_BYTES) throw safeError('Response reaches TV size limit: ' + site);
+          if (/<title[^>]*>\s*(?:Just a moment|Attention Required)/i.test(body) || /cf-browser-verification|class=["']cf-turnstile/i.test(body)) throw blocked('Cloudflare challenge: ' + site);
+          if (!response.ok) throw safeError('HTTP ' + response.status + ': ' + site, false, [502, 503, 504].indexOf(response.status) !== -1);
+          var value = body;
+          if (options.json) {
+            try { value = JSON.parse(body); } catch (ignored) { throw safeError('Invalid JSON response: ' + site); }
+          }
+          if (options.responseInfo) value = {
+            body: value,
+            status: response.status,
+            finalUrl: response.url || url,
+            contentType: response.headers && typeof response.headers.get === 'function' ? response.headers.get('content-type') || '' : '',
+            contentLength: response.headers && typeof response.headers.get === 'function' ? Number(response.headers.get('content-length')) || 0 : 0,
+            contentRange: response.headers && typeof response.headers.get === 'function' ? response.headers.get('content-range') || '' : '',
+            receivedBytes: receivedBytes,
+            data: result.data || []
+          };
+          finish(null, value);
+        });
+      }).catch(function (error) {
+        finish(error && error.providerSafe ? error : safeError('Network request failed: ' + site, false, true));
+      });
+    }).catch(function (error) {
+      // One GET retry for a transport failure or a temporary upstream outage.
+      // Never retry access restrictions, verification pages, or malformed data.
+      if (!state.cancelled && method === 'GET' && number === 0 && error.providerTransient && state.deadline - Date.now() >= timeout) return attempt(1);
+      throw error;
+    });
+  }
+  return attempt(0);
 }
 
-module.exports = { request: request, USER_AGENT: USER_AGENT, session: session };
+module.exports = { request: request, USER_AGENT: USER_AGENT, session: session, cancel: cancel };
 
+},
+"media": function(module, exports, require) {
+'use strict';
+var u = require("utils");
+
+function codecName(value) {
+  if (/^avc[13]/i.test(value)) return 'H.264';
+  if (/^(?:hvc1|hev1|hevc)/i.test(value)) return 'HEVC';
+  if (/^(?:vp09|vp9)/i.test(value)) return 'VP9';
+  if (/^av01/i.test(value)) return 'AV1';
+  if (/^mp4a/i.test(value)) return 'AAC';
+  if (/^opus/i.test(value)) return 'Opus';
+  if (/^ac-3/i.test(value)) return 'AC-3';
+  if (/^ec-3/i.test(value)) return 'E-AC-3';
+  if (/^flac/i.test(value)) return 'FLAC';
+  return '';
+}
+function codecs(values) {
+  var found = [];
+  values.forEach(function (value) {
+    String(value || '').split(',').forEach(function (item) {
+      var name = codecName(item.trim());
+      if (name && found.indexOf(name) < 0) found.push(name);
+    });
+  });
+  return found.join(' + ');
+}
+function dash(body) {
+  if (typeof body !== 'string' || body.length > 1024 * 1024 || !/<(?:[\w.-]+:)?MPD\b/i.test(body)) return null;
+  body = body.replace(/<!--[\s\S]*?-->/g, '');
+  if (!/<(?:[\w.-]+:)?Period\b/i.test(body) || !/<\/(?:[\w.-]+:)?MPD\s*>\s*$/i.test(body)) return null;
+  // This provider only exposes ordinary clear streams, not protected manifests.
+  if (/<(?:[\w.-]+:)?ContentProtection\b|default_KID|<(?:[\w.-]+:)?pssh\b/i.test(body)) return null;
+  var tags = /<(\/?)(?:[\w.-]+:)?(Representation|AdaptationSet)\b([^>]*)>/gi, match;
+  var height = 0, width = 0, values = [], representations = 0, parent = {};
+  while ((match = tags.exec(body))) {
+    var adaptation = match[2].toLowerCase() === 'adaptationset';
+    if (match[1]) { if (adaptation) parent = {}; continue; }
+    var h = Number(u.attr(match[3], 'height')) || Number(u.attr(match[3], 'maxHeight')) || 0;
+    var w = Number(u.attr(match[3], 'width')) || Number(u.attr(match[3], 'maxWidth')) || 0;
+    var codec = u.attr(match[3], 'codecs');
+    if (adaptation) { parent = { height: h, width: w, codec: codec }; continue; }
+    representations++;
+    h = h || parent.height || 0; w = w || parent.width || 0;
+    if (h > height) { height = h; width = w; }
+    values.push(codec || parent.codec);
+  }
+  if (!representations || !height || height > 8640 || width > 15360) return null;
+  return { quality: height + 'p', codecSummary: codecs(values), height: height, width: width };
+}
+function hls(body) {
+  if (typeof body !== 'string' || body.length > 1024 * 1024 || !/^\s*#EXTM3U/.test(body)) return null;
+  // AES-128 HLS can be played by the native player. DRM key formats cannot.
+  var keys = /#EXT-X-(?:SESSION-)?KEY:([^\r\n]*)/gi, key;
+  while ((key = keys.exec(body))) {
+    if (/\bMETHOD=SAMPLE-AES(?:-CTR)?\b/i.test(key[1])) return null;
+    var format = /\bKEYFORMAT=(?:"([^"]+)"|'([^']+)'|([^,\s]+))/i.exec(key[1]);
+    if (format && String(format[1] || format[2] || format[3]).toLowerCase() !== 'identity') return null;
+  }
+  var lines = body.split(/\r?\n/), playable = false;
+  for (var i = 0; i < lines.length; i++) {
+    if (!/^\s*#EXT(?:INF:|-X-STREAM-INF:)/i.test(lines[i])) continue;
+    var next = i + 1;
+    while (next < lines.length && (!lines[next].trim() || /^\s*#/.test(lines[next]))) next++;
+    if (next < lines.length && /^[^#<>\s]+$/.test(lines[next].trim())) { playable = true; break; }
+  }
+  if (!playable) return null;
+  var heights = /\bRESOLUTION=(\d+)x(\d+)/gi, match, height = 0, width = 0, values = [];
+  while ((match = heights.exec(body))) if (Number(match[2]) > height) { height = Number(match[2]); width = Number(match[1]); }
+  var codec = /\bCODECS="([^"]+)"/gi;
+  while ((match = codec.exec(body))) values.push(match[1]);
+  return { quality: height ? height + 'p' : '', codecSummary: codecs(values), height: height, width: width };
+}
+module.exports = { dash: dash, hls: hls };
 
 },
 "catalog": function(module, exports, require) {
@@ -396,6 +556,7 @@ module.exports = { parseDirectory: parseDirectory, rankResults: rankResults, epi
 'use strict';
 var u = require("utils");
 var http = require("http");
+var manifest = require("media");
 var cryptoCache;
 
 function httpsUrl(value, base) {
@@ -575,13 +736,16 @@ function resolve(html, pageURL, options) {
   }
   function verified(stream) {
     return get(stream.url, stream.headers.Referer).then(function (body) {
-      if (/^\s*#EXTM3U(?:\s|$)/.test(body)) return stream;
+      var checked = manifest.hls(body);
+      if (checked) { stream.quality = checked.quality || 'Auto'; return stream; }
       var value = String(body).trim();
       var target = /^https:\/\//i.test(value) ? httpsUrl(value, stream.url) : '';
       if (!target || target === stream.url) return null;
       return get(target, stream.headers.Referer).then(function (playlist) {
-        if (!/^\s*#EXTM3U(?:\s|$)/.test(playlist)) return null;
+        var checked = manifest.hls(playlist);
+        if (!checked) return null;
         stream.url = target;
+        stream.quality = checked.quality || 'Auto';
         return stream;
       });
     });
@@ -597,7 +761,8 @@ function resolve(html, pageURL, options) {
     var chain = Promise.resolve();
     candidates.forEach(function (stream) {
       chain = chain.then(function () {
-        return verified(stream).then(function (result) { if (result) accepted.push(result); }).catch(function (error) { if (error.siteBlocked) throw error; firstError = firstError || error; });
+        if (accepted.length) return;
+        return verified(stream).then(function (result) { if (result) accepted.push(result); }).catch(function (error) { firstError = firstError || error; });
       });
     });
     return chain.then(function () {
@@ -607,7 +772,7 @@ function resolve(html, pageURL, options) {
       frames.forEach(function (frameURL) {
         frameChain = frameChain.then(function (streams) {
           if (streams.length || visited[frameURL]) return streams;
-          return get(frameURL, url).then(function (frameHTML) { return walk(frameHTML, frameURL, depth + 1); }).catch(function (error) { if (error.siteBlocked) throw error; firstError = firstError || error; return []; });
+          return get(frameURL, url).then(function (frameHTML) { return walk(frameHTML, frameURL, depth + 1); }).catch(function (error) { firstError = firstError || error; return []; });
         });
       });
       return frameChain.then(function (streams) {
@@ -652,22 +817,22 @@ function metadata(id, cfg) {
   var token = cfg.key.length > 40;
   var url = 'https://api.themoviedb.org/3/tv/' + encodeURIComponent(id) + '?language=tr-TR';
   if (!token) url += '&api_key=' + encodeURIComponent(cfg.key);
-  return http.request(url, { json: true, bearer: token ? cfg.key : '' }).then(function (data) {
+  return http.request(url, { json: true, bearer: token ? cfg.key : '', session: cfg.session }).then(function (data) {
     return { title: data.name || '', originalTitle: data.original_name || '', year: Number(String(data.first_air_date || '').slice(0, 4)) || null };
   });
 }
 
-function directory(meta, cfg) {
+function directory(cfg) {
   // The public directory is server-rendered; the site's search endpoints can stall.
   return http.request(cfg.site + '/', { session: cfg.session }).then(function (html) {
-    return catalog.rankResults(catalog.parseDirectory(html, cfg.site), meta).slice(0, 2);
+    return catalog.parseDirectory(html, cfg.site);
   });
 }
 
 function episodePage(match, meta, cfg, season, episode) {
   return http.request(match.url, { referer: cfg.site + '/', session: cfg.session }).then(function (html) {
     var identity = catalog.pageIdentity(html);
-    if (identity.year && meta.year && Math.abs(identity.year - meta.year) > 1) return null;
+    if (identity.year && meta.year && identity.year !== meta.year) return null;
     var target = catalog.episodeUrl(html, match.url, season, episode);
     if (target) return { url: target, referer: match.url };
     var selectedSeason = catalog.seasonUrl(html, match.url, season);
@@ -687,8 +852,7 @@ function extract(page, cfg) {
   var visitedFrames = {};
   function request(url, options) {
     options = options || {};
-    // Anonymous cookies stay on their origin; media-host requests never receive site cookies.
-    if (u.sameSite(url, cfg.site)) options.session = cfg.session;
+    options.session = cfg.session;
     return http.request(url, options);
   }
   function frames(html, url) {
@@ -702,7 +866,6 @@ function extract(page, cfg) {
         streams.forEach(function (stream) { stream.sourceName = frame.name || 'Player'; });
         return streams.length ? streams : next(index + 1);
       }).catch(function (error) {
-        if (error.siteBlocked) throw error;
         console.warn('[DiziBOX TV] ' + error.message);
         return next(index + 1);
       });
@@ -714,7 +877,10 @@ function extract(page, cfg) {
     var pages = choices.filter(function (choice) { return choice.kind === 'page' && choice.url !== page.url; }).slice(0, 2);
     function next(index) {
       if (index >= pages.length) return Promise.resolve([]);
-      return request(pages[index].url, { referer: page.url }).then(function (body) { return frames(body, pages[index].url); }).then(function (result) { return result.length ? result : next(index + 1); });
+      return request(pages[index].url, { referer: page.url }).then(function (body) { return frames(body, pages[index].url); }).then(function (result) { return result.length ? result : next(index + 1); }).catch(function (error) {
+        console.warn('[DiziBOX TV] ' + error.message);
+        return next(index + 1);
+      });
     }
     return next(0);
   });
@@ -724,8 +890,11 @@ function getStreams(tmdbId, mediaType, season, episode) {
   if (['tv', 'series', 'show'].indexOf(mediaType) === -1) return Promise.resolve([]);
   if (!/^\d+$/.test(String(tmdbId)) || !/^\d+$/.test(String(season)) || !/^\d+$/.test(String(episode)) || Number(episode) < 1) return Promise.resolve([]);
   var cfg = settings();
-  return metadata(tmdbId, cfg).then(function (meta) {
-    return directory(meta, cfg).then(function (matches) {
+  if (!cfg.key) return metadata(tmdbId, cfg).catch(function (error) { console.warn('[DiziBOX TV] ' + error.message); return []; });
+  return Promise.all([metadata(tmdbId, cfg), directory(cfg)]).then(function (values) {
+    var meta = values[0];
+    var matches = catalog.rankResults(values[1], meta).slice(0, 2);
+    return Promise.resolve().then(function () {
       function next(index) {
         if (index >= matches.length) return Promise.resolve([]);
         return episodePage(matches[index], meta, cfg, season, episode).then(function (page) { return page ? extract(page, cfg) : []; }).then(function (streams) {
@@ -743,7 +912,8 @@ function getStreams(tmdbId, mediaType, season, episode) {
         return { name: 'DiziBOX TV', provider: 'DiziBOX TV', title: meta.title + ' S' + season + 'E' + episode + ' | ' + (stream.sourceName || 'Player'), url: stream.url, quality: stream.quality || 'Auto', type: stream.type || 'hls', headers: headers, subtitles: subtitles };
       });
     });
-  }).catch(function (error) {
+  }).then(function (streams) { http.cancel(cfg.session); return streams; }).catch(function (error) {
+    http.cancel(cfg.session);
     // Only helper errors or fixed local messages reach this log, never tokens or URLs with queries.
     console.warn('[DiziBOX TV] ' + error.message);
     return [];
